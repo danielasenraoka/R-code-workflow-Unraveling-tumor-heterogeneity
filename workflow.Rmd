@@ -1,0 +1,166 @@
+---
+title: "R code: Unraveling tumor heterogeneity: Quantitative insights from scRNA-seq analysis in breast cancer subtypes"
+output: html_notebook
+---
+
+This R notebook provides a detailed guide to computing the parameters used in the publication *Unraveling tumor heterogeneity: Quantitative insights from scRNA-seq analysis in breast cancer subtypes*. The analysis methodology closely follows the work described in the publication *Unraveling tumor heterogeneity: Quantitative insights from scRNA-seq analysis in breast cancer subtypes*. The breast cancer scRNA-seq datasets used in this work were obtained from the [scBrAtlas publication](https://www.embopress.org/doi/full/10.15252/embj.2020107333) available as curated scRNA-seq [datasets](https://figshare.com/articles/dataset/Data_R_code_and_output_Seurat_Objects_for_single_cell_RNA-seq_analysis_of_human_breast_tissues/17058077). As detailed in our publication, the scores were computed for each subtype dataset separately. After computing all the parameters for all samples, further standard dimensionality reduction, statistical analyses and visualization were performed, merging all the outputs.
+
+# Load packages
+
+```{r}
+library(Seurat)
+library(infercnv)
+library(ggplot2)
+library(entropy)
+```
+
+# Read data
+
+In our work, the input `cancer` is a Seurat object that contains the dataset of cancer epithelial cells, run for each subtype separately. Replace with the dataset that you want to compute the parameters for. `reference_normal` is a Seurat dataset that contains the normal epithelial cells that are used as reference to infer Copy Number Alterations with the inferCNV package.
+
+```{r}
+cancer <- readRDS(file="PATH/seurat_data.rds") #Load preprocessed cancer data (integrated)
+reference_normal <- readRDS(file="PATH/normal_reference.rds") #Load normal epithelial cells to use as reference in inferCNV
+```
+
+# Run inferCNV
+
+Prepare data input for inferCNV.
+Merge cancer and normal cells for inferCNV input.
+
+```{r}
+# Prepare reference cluster names
+reference_cluster_names <- as.vector(reference_normal@active.ident)
+reference_cluster_names_rename <- paste("N", reference_cluster_names, sep="")
+reference_normal@meta.data[["seurat_clusters"]] <- factor(reference_cluster_names_rename)
+reference_normal@active.ident <- factor(reference_cluster_names_rename)
+combined <- merge(reference_normal, y = reference_normal) #merge cancer and normal cells, data input for inferCNV
+```
+
+Extract count matrix
+
+```{r}
+count_matrix_combined <- combined@assays[["RNA"]]@counts
+combined_names <- data.frame(combined@active.ident)
+combined_names$combined.active.ident <- as.character(combined_names$combined.active.ident)
+```
+
+```{r}
+genes_order <- read.table(
+  "https://data.broadinstitute.org/Trinity/CTAT/cnv/hg38_gencode_v27.txt",
+  sep="\t", header=FALSE, row.names = 1)
+```
+
+Create the inferCNV Object
+
+```{r}
+infercnv_object = CreateInfercnvObject(raw_counts_matrix=count_matrix_combined,
+                                    annotations_file=combined_names,
+                                    delim="\t",
+                                    gene_order_file=genes_order,
+                                    ref_group_names=c("N")) 
+```
+
+Run inferCNV
+
+```{r}
+infercnv_object = infercnv::run(infercnv_object,
+                                cutoff=0.1,  # use 1 for smart-seq, 0.1 for 10x-genomics #already filtered
+                                out_dir="output", 
+                                cluster_by_groups=TRUE,   # cluster by samples
+                                denoise=T,
+                                num_threads=8,
+                                HMM=T,
+                                leiden_resolution = 0.0001,
+                                up_to_step = 17)
+```
+
+Plot heatmap
+
+```{r}
+plot_cnv(infercnv_object, title = "inferCNVoutput",
+  output_filename='inferCNV_plot', 
+  obs_title = "Observations (Cells)", ref_title = "References (Cells)",
+  cluster_by_groups = T, cluster_references = T,
+  x.center = mean(infercnv_object@expr.data), x.range = "auto",
+  hclust_method = "ward.D",
+  color_safe_pal = FALSE,
+  output_format = "pdf", ref_contig = NULL, write_expr_matrix = TRUE, useRaster = TRUE)
+```
+
+# CNA score
+
+Extract residual expression matrix to calculate the score.
+
+```{r}
+cna_matrix <- infercnv_object@expr.data
+cellnames <- Cells(cancer)
+```
+
+Compute the CNA score per cell from the inferCNV output.
+
+```{r}
+cna_matrix_squared <- (cna_matrix[,cellnames] - 1)^2 #CNA score
+cna_score <- rowMeans(t(cna_matrix))
+```
+
+
+# Shannon entropy
+
+```{r}
+DefaultAssay(cancer) <- "RNA"
+```
+
+Compute Shannon entropy.
+
+```{r}
+count_matrix <- cancer@assays[["RNA"]]@counts
+shannon_entropy <- vector(mode = "numeric", length=ncol(count_matrix))
+
+
+for (i in 1:ncol(exp_matrix)){
+    shannon_entropy[i] <- entropy.empirical(count_matrix[,i], unit = "log2") #entropy score
+}
+```
+
+# PPINs activities
+
+Load activities of PPINs associated with gene sets of interest previously calculated with PyOrigins.
+To calculate activity of the PPINs refer to the code in [PyOrigins](https://github.com/danielasenraoka/PyOrigins). Basically the only input from the scRNA-seq dataset is the normalized expression matrix.
+
+```{r}
+activity_matrix <- read.table(file = "./activities.txt")
+  
+#read.table(file = "PATH/activities.txt")
+#stat <- read.delim2("PATH/stat.txt", sep = "\t", header = FALSE) # PPINs names
+#rownames(activity_matrix) <- stat$V3
+```
+
+# Transcriptional heterogeneity
+
+Split samples to calculate heterogeneity per sample.
+
+```{r}
+cancer_list <- SplitObject(cancer, split.by = "ident")
+```
+
+Normalize per sample and calculate standarized variance.
+
+```{r}
+cancer_list <- lapply(X = cancer_list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, verbose = FALSE, selection.method="vst", nfeatures=n_hvf)
+})
+```
+
+Compute transcriptional heterogeneity as the mean standardized variance.
+
+```{r}
+mean_variance_standarized <-  vector(mode = 'numeric', length = length(cancer_list)) 
+
+for (i in 1:length(tn_cancer_integrated_list)) {
+  hvf_statistics <- HVFInfo(cancer_list[[i]])[,3]
+  mean_variance_standarized[i] <-sum(hvf_statistics)/length(hvf_statistics)
+}
+names(mean_variance_standarized) <- names(cancer_list)
+```
